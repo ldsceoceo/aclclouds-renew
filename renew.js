@@ -1,33 +1,4 @@
 #!/usr/bin/env node
-/* eslint-disable no-useless-escape */
-/**
- * ============================================================================
- *  ACLClouds (https://aclclouds.com) 免费 Discord Bot 服务器自动续期
- * ----------------------------------------------------------------------------
- *  技术栈 : Node.js 18+ / Playwright (Chromium) / GitHub Actions
- *  录制   : AgentScribe session 461bb59b (/server/<id>, 36 DOM + 49 network)
- *  关键发现:
- *    GET /api/client/servers/<id> 回包 attributes 含续期三件套:
- *      expires_at (ISO, 如 "2026-09-28T10:01:56+02:00")
- *      can_renew  (boolean) —— 门控只跟它走
- *      plan.renewal_days = 4
- *    认证 : session-cookie (remember_web_* + __Host-aclclouds_session + XSRF-TOKEN,
- *      API 请求头 X-XSRF-TOKEN = decodeURIComponent(XSRF-TOKEN cookie))
- *  主路线 : API 预检 (can_renew=false 直接 SKIP 免开浏览器) +
- *           到期才开浏览器点 Renew（录制 30e6ef2f 已确认：Renew → 403 captcha_required →
- *           点弹窗内 <cap-widget> 解算 → 前端带 captcha_token 自动重试 renew → 200）。
- *  注意   : 目录下旧 app.py/README/workflow 是 katabump 残留，已废弃，勿用。
- *
- *  必填环境变量（二选一提供凭证）:
- *    AUTH_STATE / AUTH_STATE_FILE        Playwright storageState JSON（推荐，录制即得）
- *    ACL_EMAIL / ACL_PASSWORD            账密登录（best-effort，登录页结构未完全确认）
- *    SERVER_PAGE_URL                     服务器页面地址，多个用换行/逗号分隔
- *  可选环境变量:
- *    SERVER_ID / GH_TOKEN + AUTO_UPDATE_STATE / TG_BOT_TOKEN / TG_CHAT_ID
- *  网络   : NODE_LINK 经 sing-box 本地代理（参考 HidenCloud），代理不可连自动直连。
- *    DRY_RUN / HEADLESS / TIMEZONE / LOCALE / NAV_TIMEOUT / LOGIN_URL
- * ============================================================================
- */
 
 'use strict';
 
@@ -35,8 +6,6 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const { chromium } = require('playwright');
-
-/* ============================== 配置区 ============================== */
 
 const env = (k, d = '') => (process.env[k] === undefined ? d : String(process.env[k])).trim() || d;
 const bool = (k, d = false) => {
@@ -52,13 +21,10 @@ const num = (k, d) => {
 const CFG = {
   loginUrl: env('LOGIN_URL', 'https://aclclouds.com/auth/login'),
   serverBase: env('SERVER_BASE', 'https://aclclouds.com/server/'),
-  apiBase: env('API_BASE', 'https://aclclouds.com/api/client/servers/'),
   email: env('ACL_EMAIL'),
   password: env('ACL_PASSWORD'),
-  authStateRaw: env('AUTH_STATE'),
-  authStateFile: env('AUTH_STATE_FILE'),
+  cookieValue: env('COOKIE_VALUE'),
   ghToken: env('GH_TOKEN'),
-  autoUpdateState: bool('AUTO_UPDATE_STATE', false),
   repo: env('GITHUB_REPOSITORY'),
   tgToken: env('TG_BOT_TOKEN'),
   tgChatId: env('TG_CHAT_ID'),
@@ -158,7 +124,7 @@ function maskEmail() {
     const [name, domain] = e.split('@', 2);
     return name.length > 4 ? `${name.slice(0, 2)}****${name.slice(-2)}@${domain}` : `${name}@${domain}`;
   }
-  return e ? `${e.slice(0, 2)}****` : 'AUTH_STATE登录';
+  return e ? `${e.slice(0, 2)}****` : 'COOKIE_VALUE登录';
 }
 
 /** 原生 https 发 TG 通知（佬王风格：parse_mode HTML，直发无降级） */
@@ -208,117 +174,22 @@ async function safeShot(page, name) {
 
 /* ============================== 登录态 ============================== */
 
-/** 读取 AUTH_STATE（内联 JSON / base64(JSON) / 文件路径）；兼容 storageState: 前缀粘贴 */
-function loadAuthState() {
-  const candidates = [];
-  if (CFG.authStateFile && fs.existsSync(CFG.authStateFile)) candidates.push(fs.readFileSync(CFG.authStateFile, 'utf8'));
-  if (CFG.authStateRaw) candidates.push(CFG.authStateRaw);
-  const stripPrefix = (s) => {
-    const t = String(s || '').trim();
-    const m = t.match(/^(?:(?:const|let|var)\s+)?storageState\s*[:=]\s*(\{[\s\S]*\})\s*;?\s*$/);
-    if (m) return m[1];
-    const i = t.indexOf('{');
-    const j = t.lastIndexOf('}');
-    if (i > 0 && j > i) {
-      const sub = t.slice(i, j + 1);
-      try { JSON.parse(sub); return sub; } catch { /* not json */ }
-    }
-    return t;
+/** 由 COOKIE_VALUE 构建 Playwright storageState（remember_web cookie，自动补全其余会话 cookie） */
+function buildAuthState() {
+  if (!CFG.cookieValue) return null;
+  log(`🍪 使用 COOKIE_VALUE（${CFG.cookieValue.length}字）注入 remember_web 登录态`);
+  return {
+    cookies: [{
+      name: 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
+      value: CFG.cookieValue,
+      domain: 'aclclouds.com',
+      path: '/',
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+    }],
+    origins: [],
   };
-  for (const c of candidates) {
-    const cleaned = stripPrefix(c);
-    const tries = [cleaned];
-    try { tries.push(Buffer.from(cleaned, 'base64').toString('utf8')); } catch { /* ignore */ }
-    for (const t of tries) {
-      try {
-        const j = JSON.parse(t);
-        if (j && (Array.isArray(j.cookies) || Array.isArray(j.origins))) return j;
-      } catch { /* ignore */ }
-    }
-  }
-  if (CFG.authStateRaw) log(`⚠️ AUTH_STATE 已配置(${CFG.authStateRaw.length}字)但解析失败：需纯JSON{"cookies":[],"origins":[]}`);
-  return null;
-}
-
-/** storageState → Cookie 请求头 */
-function cookieHeaderFromState(state) {
-  try {
-    return (state.cookies || []).map((c) => `${c.name}=${c.value}`).join('; ');
-  } catch { return ''; }
-}
-
-/** XSRF-TOKEN cookie → X-XSRF-TOKEN 请求头（录制：解码后原文） */
-function xsrfHeaderFromState(state) {
-  try {
-    const c = (state.cookies || []).find((x) => x.name === 'XSRF-TOKEN');
-    if (!c) return null;
-    try { return decodeURIComponent(c.value); } catch { return c.value; }
-  } catch { return null; }
-}
-
-function httpsGetJson(urlStr, headers) {
-  return new Promise((resolve) => {
-    const u = new URL(urlStr);
-    const req = https.get({
-      hostname: u.hostname, path: u.pathname + u.search,
-      headers: { 'User-Agent': CFG.ua, ...headers }, timeout: 20000,
-    }, (r) => {
-      let buf = '';
-      r.on('data', (c) => (buf += c));
-      r.on('end', () => resolve({ status: r.statusCode, body: buf }));
-    });
-    req.on('error', (e) => resolve({ status: 0, body: '', error: e.message }));
-    req.on('timeout', () => { req.destroy(new Error('timeout')); resolve({ status: 0, body: '', error: 'timeout' }); });
-  });
-}
-
-/**
- * API 拉服务器详情。返回 { ok, can_renew, expires_at, status, suspended }。
- * 门控只跟 can_renew 布尔走；expires_at 仅展示与复核。
- */
-async function apiServerDetail(id, state) {
-  const fail = (note) => ({ ok: false, note });
-  if (!state) return fail('无登录态');
-  const xsrf = xsrfHeaderFromState(state);
-  if (!xsrf) return fail('登录态缺 XSRF-TOKEN');
-  const r = await httpsGetJson(`${CFG.apiBase}${id}`, {
-    Accept: 'application/json',
-    'X-Requested-With': 'XMLHttpRequest',
-    'X-XSRF-TOKEN': xsrf,
-    Cookie: cookieHeaderFromState(state),
-    Referer: `${CFG.serverBase}${id}`,
-  });
-  if (r.status === 401 || r.status === 419) return fail(`登录态失效(HTTP ${r.status})`);
-  if (r.status !== 200) return fail(`HTTP ${r.status}${r.error ? `(${r.error})` : ''}`);
-  try {
-    const j = JSON.parse(r.body);
-    const a = j.attributes || j;
-    return {
-      ok: true,
-      can_renew: a.can_renew === true,
-      expires_at: a.expires_at || null,
-      status: a.status || null,
-      suspended: !!a.is_suspended,
-    };
-  } catch { return fail('回包无法解析'); }
-}
-
-/**
- * 预检。返回 { decision: 'SKIP' | 'GO' | 'FALLBACK', note, detail? }。
- * SKIP = can_renew=false，未到期；GO = can_renew=true；FALLBACK = 查不到，走浏览器兜底。
- */
-async function apiCheckOne(url, id, state) {
-  const d = await apiServerDetail(id, state);
-  if (!d.ok) {
-    log(`📡 预检失败(${d.note})，回退浏览器`);
-    return { decision: 'FALLBACK', note: d.note };
-  }
-  if (d.can_renew) {
-    log(`📡 预检: can_renew=true，到期需续 (expires_at=${d.expires_at || '?'})`);
-    return { decision: 'GO', note: `can_renew=true (expires_at=${d.expires_at || '?'})`, detail: d };
-  }
-  log(`📡 预检: can_renew=false，未到期 (expires_at=${d.expires_at || '?'})`);
-  return { decision: 'SKIP', note: `can_renew=false (expires_at=${d.expires_at || '?'})`, detail: d };
 }
 
 /* ============================== 浏览器续期 ============================== */
@@ -360,85 +231,7 @@ async function dumpState(context) {
   }
 }
 
-async function updateGithubSecret(name, value) {
-  if (!CFG.ghToken || !CFG.repo) { log('ℹ️ 未提供 GH_TOKEN/GITHUB_REPOSITORY，跳过回写 Secret'); return false; }
-  const [owner, repo] = CFG.repo.split('/');
-  try {
-    const { execFile } = require('child_process');
-    await new Promise((resolve, reject) => {
-      execFile('gh', ['secret', 'set', name, '--body', value, '--repo', `${owner}/${repo}`],
-        { env: { ...process.env, GH_TOKEN: CFG.ghToken }, timeout: 60000 },
-        (err, so, se) => (err ? reject(new Error(se || err.message)) : resolve(so)));
-    });
-    log(`✅ 已更新 Secret: ${name}`);
-    return true;
-  } catch (e) {
-    log(`⚠️ gh CLI 写入失败: ${String(e.message).slice(0, 200)}`);
-    return false;
-  }
-}
-
-/**
- * cron 回写（参考 oyz/FreezeHost）：续期成功后按 expires_at-1天 改写
- * .github/workflows/renew.yml 的 cron 行为一次性定时并 push，下次到期前才唤醒。
- * 注意：默认 GITHUB_TOKEN 推不了 workflow 文件，GH_TOKEN 必须是带 workflow 作用域的 PAT。
- */
-async function updateCronSchedule(afterExpiresAt) {
-  if (CFG.dryRun) { log('ℹ️ DRY_RUN 演练，跳过 cron 回写'); return false; }
-  if (!process.env.GITHUB_ACTIONS) { log('ℹ️ 非 CI 环境，跳过 cron 回写'); return false; }
-  if (!CFG.ghToken || !CFG.repo) { log('ℹ️ 未提供 GH_TOKEN/GITHUB_REPOSITORY，跳过 cron 回写'); return false; }
-  const t = Date.parse(afterExpiresAt);
-  if (!Number.isFinite(t)) { log(`⚠️ expires_at 不可解析(${afterExpiresAt})，跳过 cron 回写`); return false; }
-  let next = new Date(t - 24 * 3600 * 1000); // 到期前 1 天
-  if (next.getTime() <= Date.now()) next = new Date(Date.now() + 12 * 3600 * 1000); // 兜底 12h 后
-  const p2 = (n) => String(n).padStart(2, '0');
-  const newCron = `10 10 ${next.getUTCDate()} ${next.getUTCMonth() + 1} *`; // 一次性 cron，下次成功后续写
-  const nextStr = `${next.getUTCFullYear()}-${p2(next.getUTCMonth() + 1)}-${p2(next.getUTCDate())} ${p2(next.getUTCHours())}:${p2(next.getUTCMinutes())}`;
-  const wf = path.join(process.cwd(), '.github', 'workflows', 'renew.yml');
-  if (!fs.existsSync(wf)) { log('⚠️ 找不到 renew.yml，跳过 cron 回写'); return false; }
-  const old = fs.readFileSync(wf, 'utf8');
-  const re = /^(\s*- cron: )'[^']*'(.*)$/m;
-  const m = old.match(re);
-  if (!m) { log('⚠️ renew.yml 无 cron 行，跳过 cron 回写'); return false; }
-  const updated = old.replace(re, `${m[1]}'${newCron}'  # auto: 下一次 ${nextStr} UTC`);
-  if (updated === old) { log('ℹ️ cron 无变化，跳过提交'); return false; }
-  fs.writeFileSync(wf, updated);
-  log(`📅 cron 回写: ${m[0].trim()} ➔ ${updated.match(re)[0].trim()}`);
-  try {
-    const { execFile } = require('child_process');
-    const run = (args) => new Promise((resolve, reject) => {
-      execFile('git', args, { cwd: process.cwd(), timeout: 60000 },
-        (err, so, se) => (err ? reject(new Error(se || err.message)) : resolve(so)));
-    });
-    await run(['pull', '--rebase']);
-    await run(['config', 'user.name', 'github-actions[bot]']);
-    await run(['config', 'user.email', 'github-actions[bot]@users.noreply.github.com']);
-    await run(['add', '.github/workflows/renew.yml']);
-    if (!(await run(['status', '--porcelain', '.github/workflows/renew.yml'])).trim()) {
-      log('ℹ️ rebase 后 cron 无变化，跳过提交'); return false;
-    }
-    const [owner, repo] = CFG.repo.split('/');
-    await run(['commit', '-m', '自动调整下次续期时间', '-m', `下次运行: ${nextStr} UTC`, '-m', `续期后到期: ${afterExpiresAt}`]);
-    await run(['remote', 'set-url', 'origin', `https://x-access-token:${CFG.ghToken}@github.com/${owner}/${repo}.git`]);
-    await run(['push']);
-    log('✅ cron 回写已 push');
-    return true;
-  } catch (e) {
-    log(`⚠️ cron 回写 push 失败（本次续期不受影响）: ${String(e.message).slice(0, 200)}`);
-    return false;
-  }
-}
-
-/**
- * 单个服务器续期（can_renew=true 时才进）。
- * 录制 30e6ef2f（dashboard/projects）已确认真实流程：点 Renew →
- * POST /api/client/servers/<id>/upgrade/renew 先回 403 captcha_required →
- * 弹窗 Anti-bot confirmation 内点 <cap-widget>（Cap.js，约6s 解算）→
- * POST cap.aclclouds.com/<sk>/redeem 取 token →
- * 前端自动带 {captcha_token: "<sk>:...:..."} 重试 renew → 200，expires_at 延后4天。
- * 故弹窗里必须点 cap-widget（"Verify you're human"），点 Confirm/Yes 无效。
- */
-async function renewOneServer(context, url, idx, total, liveState) {
+async function renewOneServer(context, url, idx, total) {
   const page = await context.newPage();
   const id = serverIdOf(url);
   const result = { idx, total, url, id, status: 'FAIL', before: null, after: null, note: '' };
@@ -455,12 +248,15 @@ async function renewOneServer(context, url, idx, total, liveState) {
       return result;
     }
 
-    const before = await apiServerDetail(id, liveState);
-    result.before = before.ok ? (before.expires_at || '?') : '未读取到';
-    log(`⏱️ 到期: ${result.before}`);
+    // 从页面读到期时间（div.srv-expiry 内文案，如 "Temps restant : 3j 19h"）
+    const beforeTxt = await page.evaluate(() => {
+      const el = document.querySelector('.srv-expiry-text, .srv-expiry');
+      return el ? (el.innerText || '').trim().slice(0, 100) : '';
+    }).catch(() => '');
+    result.before = beforeTxt || '?';
+    log(`⏱️ 页面到期信息: ${result.before}`);
 
     if (CFG.dryRun) { result.status = 'PENDING'; result.note = 'DRY_RUN 演练，未点击'; return result; }
-
     // 找续期按钮（泛匹配；录制时 can_renew=false 故无精确选择器）
     const btn = page.locator('button, a, [role="button"]')
       .filter({ hasText: /^.*renew.*$/i }).first();
@@ -515,11 +311,11 @@ async function renewOneServer(context, url, idx, total, liveState) {
       }
       if (!capClicked) capClicked = await clickByText(modal, ["Verify you're human", 'Verify'], { timeout: 1500 });
       if (capClicked) {
-        // Cap 解算约6s（录制 8.2s→13.8s），等 Solved 文案最多30s；等不到也继续轮询后端
+        // Cap 解算约6s（录制 8.2s→13.8s），等 Solved 文案最多30s；等不到也继续
         try {
           await page.getByText("You're human", { exact: false }).first().waitFor({ state: 'visible', timeout: 30000 });
           log('✅ Cap 已解算 (You\'re human)');
-        } catch { log('ℹ️ 未探测到 Solved 文案，继续轮询后端'); }
+        } catch { log('ℹ️ 未探测到 Solved 文案，继续'); }
       } else {
         const ok = await clickByText(modal, ['Renew', 'Confirm', 'Yes', 'Continue', 'Submit', 'OK'], { timeout: 1200 });
         if (!ok) await clickByText(page.locator('body'), ['Confirm', 'Yes', 'OK'], { timeout: 1000 }).catch(() => false);
@@ -534,19 +330,24 @@ async function renewOneServer(context, url, idx, total, liveState) {
     if (alert) log(`📩 页面提示: ${alert}`);
     const low = alert.toLowerCase();
 
-    // 独立复核：Cap 解算 + 前端自动重试 renew 需要时间，每5s 重读 detail，最长90s
-    let after = await apiServerDetail(id, liveState);
-    for (let i = 0; i < 18 && !(before.ok && after.ok && before.expires_at && after.expires_at && before.expires_at !== after.expires_at) && !/renewed|success|extended/.test(low); i++) {
-      await sleep(5000);
-      after = await apiServerDetail(id, liveState);
-    }
-    result.after = after.ok ? (after.expires_at || '?') : '未读取到';
+    // Cap 解算 + 前端自动重试 renew 需要时间，等页面提示出现或刷新页面读新到期时间
+    await sleep(5000);
+    // 刷新页面后重读到期信息
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: CFG.navTimeout });
+      await sleep(2500);
+    } catch { /* ignore */ }
+    const afterTxt = await page.evaluate(() => {
+      const el = document.querySelector('.srv-expiry-text, .srv-expiry');
+      return el ? (el.innerText || '').trim().slice(0, 100) : '';
+    }).catch(() => '');
+    result.after = afterTxt || '?';
     log(`🔍 复核: ${result.before} ➔ ${result.after}`);
     await safeShot(page, `server-${idx}-verify.png`);
 
-    if (/renewed|success|extended/.test(low) || (before.ok && after.ok && before.expires_at && after.expires_at && before.expires_at !== after.expires_at)) {
+    if (/renewed|success|extended/i.test(low) || (result.before !== result.after)) {
       result.status = 'SUCCESS';
-      result.note = alert || `expires_at 已更新`;
+      result.note = alert || '页面到期信息已更新';
       log('🎉 续期成功');
     } else if (/can't renew|unable|not yet|cooldown|too early/i.test(low)) {
       result.status = 'PENDING';
@@ -554,9 +355,9 @@ async function renewOneServer(context, url, idx, total, liveState) {
       log(`⏳ ${result.note}`);
     } else {
       result.status = 'FAIL';
-      result.note = alert ? `点击完成但未确认: ${alert}` : '点击完成但时长未变化（cap-widget 可能未解算成功）';
+      result.note = alert ? `点击完成但未确认: ${alert}` : '点击完成但页面到期信息未变化（cap-widget 可能未解算成功）';
       await safeShot(page, `server-${idx}-fail.png`);
-      log('❌ 后端未入账或无法确认');
+      log('❌ 未能确认续期成功');
     }
   } catch (e) {
     result.note = (result.note || '') + ` 异常: ${String(e.message).slice(0, 120)}`;
@@ -571,27 +372,118 @@ async function renewOneServer(context, url, idx, total, liveState) {
 
 /* ============================== 登录 ============================== */
 
-/** 账密登录（best-effort：登录页结构待确认，优先用 AUTH_STATE） */
+/** 等待 cap-widget 解算（"You're human" 出现或 Solved 文案） */
+async function waitCapSolved(page, timeout = 30000) {
+  try {
+    await page.getByText("You're human", { exact: false }).first().waitFor({ state: 'visible', timeout });
+    log('✅ Cap 已解算 (You\'re human)');
+    return true;
+  } catch {
+    log('ℹ️ 未探测到 Cap Solved 文案，继续');
+    return false;
+  }
+}
+
+/** 点击表单内 cap-widget，多次重试直到解算成功 */
+async function clickFormCapWidget(page) {
+  const selectors = [
+    'div.auth-cap-widget > cap-widget',
+    'form cap-widget',
+    'div.auth-form-card cap-widget',
+    'cap-widget',
+  ];
+  for (let round = 0; round < 4; round++) {
+    for (const sel of selectors) {
+      const cap = page.locator(sel).first();
+      try {
+        await cap.waitFor({ state: 'visible', timeout: 3000 });
+        log(`👆 点击 cap-widget（${sel}）第 ${round + 1} 轮`);
+        await cap.click({ timeout: 5000 });
+        await waitCapSolved(page);
+        return true;
+      } catch { /* 换下一个选择器 */ }
+    }
+    log('⚠️ cap-widget 未解算，1s 后重试…');
+    await sleep(1000);
+  }
+  return false;
+}
+
+/**
+ * 账密登录（基于 AgentScribe session 751a24bb 抓包确认的登录表单结构）：
+ *  登录页  https://aclclouds.com/auth/login
+ *  用户名  #username        （type="text"，非 email）
+ *  密码    #password
+ *  Cap     div.auth-cap-widget > cap-widget（提交前必须解算，约 6s）
+ *  提交    button.auth-submit-btn（"Se connecter"）
+ *  成功    跳转 /dashboard
+ * 流程：填账密 → 点 cap-widget → 等解算 → 点提交 → 验证跳转
+ */
 async function doLogin(page) {
-  log('🔑 账密登录（best-effort）');
+  log('🔑 账密登录');
   await gotoRetry(page, CFG.loginUrl, { waitUntil: 'domcontentloaded', timeout: CFG.navTimeout });
   await sleep(2500);
   if (await isLoggedIn(page)) { log('✅ 已有有效登录态，跳过登录'); return true; }
   try {
-    const email = page.locator('input[type="email"], input[name*="email" i]').first();
-    const pass = page.locator('input[type="password"]').first();
-    await email.waitFor({ state: 'visible', timeout: 20000 });
-    await email.fill(CFG.email);
-    await pass.fill(CFG.password);
-    await clickByText(page, ['Sign in', 'Log in', 'Login', 'Continue'], { timeout: 3000 });
-    await sleep(3000);
+    // 填写用户名（#username，type=text；兼容 form 内其他候选）
+    const userInput = page.locator('#username, input[name="username"], input[type="email"]').first();
+    // 填写密码（#password）
+    const passInput = page.locator('#password, input[type="password"]').first();
+    await userInput.waitFor({ state: 'visible', timeout: 20000 });
+    log(`⌨️ 填写用户名…`);
+    await userInput.fill(CFG.email);
+    log(`⌨️ 填写密码…`);
+    await passInput.fill(CFG.password);
+    await sleep(500);
+
+    // 提交前必须先解算 cap-widget（录制：0:08 点 cap → 0:14 点提交，约 6s 解算）
+    log('🛡️ 处理表单内 cap-widget…');
+    const capOk = await clickFormCapWidget(page);
+    if (!capOk) log('⚠️ cap-widget 未确认解算，仍将尝试提交…');
+
+    // 点提交按钮（button.auth-submit-btn；兼容泛文案）
+    await sleep(1000);
+    const submitBtn = page.locator('button.auth-submit-btn, button[type="submit"]').first();
+    try {
+      await submitBtn.waitFor({ state: 'visible', timeout: 10000 });
+      log('🖱️ 点击提交按钮');
+      await submitBtn.click({ timeout: 5000 });
+    } catch {
+      const ok = await clickByText(page, ['Se connecter', 'Sign in', 'Log in', 'Login', 'Continue'], { timeout: 3000 });
+      if (!ok) {
+        log('❌ 未找到提交按钮');
+        await safeShot(page, 'login-no-submit.png');
+        return false;
+      }
+    }
+
+    // 提交后等跳转离开登录页（登录成功 → /dashboard）
+    log('⏳ 等待登录跳转…');
+    const navStart = Date.now();
+    let navigated = false;
+    while (Date.now() - navStart < 120000) {
+      const url = page.url || '';
+      if (!url.includes('/auth/login') && !url.includes('/login')) { navigated = true; break; }
+      // 跳转后可能遇到 cap 拦截
+      if (await isLoggedIn(page)) { navigated = true; break; }
+      await sleep(1000);
+    }
+    if (!navigated) {
+      log('❌ 提交后 120s 内未完成跳转，登录失败');
+      await safeShot(page, 'login-timeout.png');
+      return false;
+    }
+    // 最终验证
+    await sleep(2000);
+    const ok = await isLoggedIn(page);
+    log(ok ? '✅ 登录成功，已到达 /dashboard' : '⚠️ 已跳转但未检测到 dashboard 文案');
+    if (ok) await safeShot(page, 'login-success.png');
+    return ok;
   } catch (e) {
-    log(`❌ 登录表单未找到: ${String(e.message).slice(0, 100)}`);
+    log(`❌ 登录异常: ${String(e.message).slice(0, 150)}`);
+    await safeShot(page, 'login-error.png');
     return false;
   }
-  const ok = await isLoggedIn(page);
-  log(ok ? '✅ 登录成功' : '❌ 登录后未检测到服务器页');
-  return ok;
 }
 
 /* ============================== 汇报 ============================== */
@@ -599,8 +491,8 @@ async function doLogin(page) {
 /** TG 报告（佬王同款 eooce 风：标题 + 状态 + 脱敏账号 + 前后到期 + IP + 北京时间） */
 async function reportResults(results, currentIp = '未知') {
   results.sort((a, b) => a.idx - b.idx);
-  const STATUS = { SUCCESS: '✅ 续期成功', PENDING: '⏳ 未到续期时间', NO_BUTTON: '❌ 未找到按钮', FAIL: '❌ 续期失败' };
-  const ICON = { SUCCESS: '🟢', PENDING: '⚪', NO_BUTTON: '🟡', FAIL: '🔴' };
+  const STATUS = { SUCCESS: '✅ 续期成功', NO_BUTTON: '❌ 未找到按钮', FAIL: '❌ 续期失败' };
+  const ICON = { SUCCESS: '🟢', NO_BUTTON: '🟡', FAIL: '🔴' };
   const HIDE_DATE = new Set(['?', '-', '未读取到', '', null, undefined]);
   const lines = ['🎉 ACLClouds 续期通知', ''];
   for (const r of results) {
@@ -630,16 +522,16 @@ async function reportResults(results, currentIp = '未知') {
     console.error('❌ 未配置 SERVER_PAGE_URL（或 SERVER_ID），脚本终止');
     process.exit(1);
   }
-  const state = loadAuthState();
+  const state = buildAuthState();
   if (!state && (!CFG.email || !CFG.password)) {
-    console.error('❌ 需至少提供 AUTH_STATE，或 ACL_EMAIL + ACL_PASSWORD');
+    console.error('❌ 需至少提供 COOKIE_VALUE，或 ACL_EMAIL + ACL_PASSWORD');
     process.exit(1);
   }
 
   log('#'.repeat(64));
   log('   ACLClouds (aclclouds.com) 自动续期  v1.0');
-  log(`   目标数: ${targets.length} | 门控: can_renew 布尔 | DRY_RUN: ${CFG.dryRun}`);
-  log(`   代理: ${CFG.proxyUrl || '直连'} | headless: ${CFG.headless} | 登录: ${state ? '登录态注入(可降级账密)' : '账密'}`);
+  log(`   目标数: ${targets.length} | DRY_RUN: ${CFG.dryRun}`);
+  log(`   代理: ${CFG.proxyUrl || '直连'} | headless: ${CFG.headless} | 登录: ${state ? 'COOKIE_VALUE注入(可降级账密)' : '账密'}`);
   log('#'.repeat(64));
 
   if (!fs.existsSync(CFG.shotDir)) fs.mkdirSync(CFG.shotDir, { recursive: true });
@@ -667,90 +559,42 @@ async function reportResults(results, currentIp = '未知') {
   const currentIp = await getCurrentIp();
   log(`🎯 当前出口IP: ${currentIp}`);
 
-  // 1) API 预检优先：can_renew=false 直接汇报退出，不启动浏览器
+  // 启动浏览器
   const results = [];
-  let browserTargets = targets.map((url, i) => ({ url, idx: i + 1 }));
-  {
-    log('📡 API 预检中（can_renew 门控，未到期免开浏览器）…');
-    const remain = [];
-    for (const t of browserTargets) {
-      const c = await apiCheckOne(t.url, serverIdOf(t.url), state);
-      if (c.decision === 'SKIP') {
-        log(`⏳ [${t.idx}/${targets.length}] ${c.note}，跳过浏览器`);
-        results.push({ idx: t.idx, total: targets.length, url: t.url, id: serverIdOf(t.url), status: 'PENDING', before: (c.detail && c.detail.expires_at) || null, after: null, note: c.note });
-      } else {
-        log(`➡️ [${t.idx}/${targets.length}] ${c.note}，走浏览器`);
-        remain.push(t);
-      }
-    }
-    browserTargets = remain;
-    if (!browserTargets.length) {
-      log('✅ 全部未到期，本次免开浏览器');
-      await reportResults(results, currentIp);
-      return;
-    }
-  }
-
-  // 2) 有到期目标才启动浏览器
+  const browserTargets = targets.map((url, i) => ({ url, idx: i + 1 }));
   const browser = await chromium.launch(launchOpts);
   const ctxOpts = { viewport: { width: 1920, height: 1080 }, userAgent: CFG.ua, locale: CFG.locale, timezoneId: CFG.timezone };
   if (state) ctxOpts.storageState = state;
   const context = await browser.newContext(ctxOpts);
 
   let authOk = false;
-  let dumped = null;
   const first = await context.newPage();
   try {
     if (state) {
-      log('🍪 使用注入登录态访问目标页');
+      log('🍪 使用 COOKIE_VALUE 注入登录态访问目标页');
       await gotoRetry(first, browserTargets[0].url, { waitUntil: 'domcontentloaded', timeout: CFG.navTimeout });
       await sleep(2500);
       if (await isLoggedIn(first)) authOk = true;
-      else log('⚠️ 登录态已失效，降级为账密登录');
+      else log('⚠️ COOKIE_VALUE 已失效，降级为账密登录');
     }
     if (!authOk && CFG.email && CFG.password) authOk = await doLogin(first);
     if (!authOk) {
       await safeShot(first, 'login-failed.png');
       await dumpState(context);
-      throw new Error('登录失败（账密或登录态均不可用）');
+      throw new Error('登录失败（COOKIE_VALUE 和账密均不可用）');
     }
-    dumped = await dumpState(context);
-    if (dumped && CFG.autoUpdateState && CFG.ghToken) await updateGithubSecret('AUTH_STATE', dumped);
+    // 导出登录态供本地调试（不自动回写 Secret，COOKIE_VALUE 需手动更新）
+    await dumpState(context);
   } finally { await first.close().catch(() => {}); }
 
-  let liveState = state;
-  try { liveState = JSON.parse(dumped) || state; } catch { /* keep state */ }
-
-  // 3) 登录后复检一次（token 刷新后 can_renew 可能已可读）
-  {
-    const remain = [];
-    for (const t of browserTargets) {
-      if (results.some((r) => r.idx === t.idx)) continue;
-      const c = await apiCheckOne(t.url, serverIdOf(t.url), liveState);
-      if (c.decision === 'SKIP') {
-        log(`⏳ [${t.idx}/${targets.length}] 登录后复检：${c.note}，跳过浏览器`);
-        results.push({ idx: t.idx, total: targets.length, url: t.url, id: serverIdOf(t.url), status: 'PENDING', before: (c.detail && c.detail.expires_at) || null, after: null, note: c.note });
-      } else {
-        remain.push(t);
-      }
-    }
-    browserTargets = remain;
-  }
-
   for (const t of browserTargets) {
-    try { results.push(await renewOneServer(context, t.url, t.idx, targets.length, liveState)); }
+    try { results.push(await renewOneServer(context, t.url, t.idx, targets.length)); }
     catch (e) { log(`❌ 服务器 ${t.idx} 未捕获异常: ${e.message}`); results.push({ idx: t.idx, total: targets.length, url: t.url, id: serverIdOf(t.url), status: 'FAIL', before: '-', after: '-', note: e.message.slice(0, 100) }); }
     await sleep(1500);
   }
   await context.storageState({ path: path.join(CFG.shotDir, 'storage-state-final.json') }).catch(() => {});
   await browser.close();
   log('🏁 浏览器已关闭');
-
-  // 续期成功后回写 cron（oyz/FreezeHost 式自我调度，多服取最早到期）
-  const okExpires = results
-    .filter((r) => r.status === 'SUCCESS' && r.after && !['?', '-', '未读取到'].includes(r.after))
-    .map((r) => Date.parse(r.after)).filter(Number.isFinite);
-  if (okExpires.length) await updateCronSchedule(new Date(Math.min(...okExpires)).toISOString());
 
   await reportResults(results, currentIp);
 })().catch(async (e) => {

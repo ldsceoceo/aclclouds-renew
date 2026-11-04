@@ -8,11 +8,11 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
 
 jobs:
   renew:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
@@ -42,8 +42,8 @@ jobs:
 
       - name: 🔐 验证登录凭证
         run: |
-          if [ -z "${{ secrets.ACL_EMAIL }}" ] && [ -z "${{ secrets.AUTH_STATE }}" ]; then
-            echo "❌ 未配置 ACL_EMAIL / ACL_PASSWORD，或 AUTH_STATE"
+          if [ -z "${{ secrets.ACL_EMAIL }}" ] && [ -z "${{ secrets.COOKIE_VALUE }}" ]; then
+            echo "❌ 未配置 COOKIE_VALUE，或 ACL_EMAIL + ACL_PASSWORD"
             exit 1
           fi
 
@@ -51,12 +51,10 @@ jobs:
         env:
           ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+          COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
           SERVER_PAGE_URL: ${{ secrets.SERVER_PAGE_URL }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
-          AUTH_STATE: ${{ secrets.AUTH_STATE }}
-          AUTH_STATE_FILE: ''
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          AUTO_UPDATE_STATE: ${{ vars.AUTO_UPDATE_STATE || 'true' }}
           DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
           HEADLESS: true
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Shanghai' }}
@@ -73,6 +71,20 @@ jobs:
           path: screenshots/*.png
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: 🕒 更新时间戳
+        # 每次运行更新 time.txt，防止 6 个月无更新导致 GitHub 暂停 Actions
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "No need to commit"
+          else
+            git commit -m "⏱️ Auto Update $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD
+          fi
 
       - name: 🧹 清理旧工作流记录
         if: always()
