@@ -35,7 +35,7 @@ COOKIE_VALUE 失效信号：日志出现 `COOKIE_VALUE 已失效，降级为账�
 
  1. 新建 GitHub 仓库，把本目录文件推上去。
  2. Settings → Secrets and variables → Actions 配好上表 Secrets。
- 3. Actions 启用工作流，手动跑一次看日志。定时为每 2 天巡检一次（`renew.yml` cron `10 10 */2 * *`，即每月奇数日）：Free 档 4 天一续、到期前 2 天开放续期，任意连续 2 天必含一个奇数日，窗口必命中。每次运行自动更新 `time.txt`，防止 6 个月无活动导致 GitHub 暂停 Actions。
+ 3. Actions 启用工作流，手动跑一次看日志。定时为每 3 天巡检一次（`renew.yml` cron `10 10 1,4,7,...,31 * *`）：Free 档 4 天一续、到期前 2 天开放续期，3 天间隔必覆盖 2 天窗口。每次运行自动更新 `time.txt`，防止 6 个月无活动导致 GitHub 暂停 Actions。
 
 ## 本地调试
 

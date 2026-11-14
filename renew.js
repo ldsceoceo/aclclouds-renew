@@ -269,7 +269,19 @@ async function renewOneServer(context, url, idx, total) {
       await btn.click({ timeout: 8000 });
     } catch {
       hasBtn = await clickByText(page, ['Renew', 'Renew Server', 'Renew now'], { timeout: 1500 });
-      if (!hasBtn) { result.note = '未找到 Renew 按钮（可能 UI 改版，需补录）'; await safeShot(page, `server-${idx}-norenew.png`); result.status = 'NO_BUTTON'; return result; }
+      if (!hasBtn) {
+        // 页面明示到期前2天才可续 → 未到续期窗口，属正常状态
+        const bodyTxt = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
+        if (/renewal[^.\n]{0,40}available/i.test(bodyTxt)) {
+          result.status = 'PENDING';
+          result.note = '未到续期时间';
+          return result;
+        }
+        result.note = '未找到 Renew 按钮（可能改版，需补录）';
+        await safeShot(page, `server-${idx}-norenew.png`);
+        result.status = 'NO_BUTTON';
+        return result;
+      }
     }
     await sleep(2000);
 
@@ -491,16 +503,16 @@ async function doLogin(page) {
 /** TG 报告（佬王同款 eooce 风：标题 + 状态 + 脱敏账号 + 前后到期 + IP + 北京时间） */
 async function reportResults(results, currentIp = '未知') {
   results.sort((a, b) => a.idx - b.idx);
-  const STATUS = { SUCCESS: '✅ 续期成功', NO_BUTTON: '❌ 未找到按钮', FAIL: '❌ 续期失败' };
-  const ICON = { SUCCESS: '🟢', NO_BUTTON: '🟡', FAIL: '🔴' };
+  const STATUS = { SUCCESS: '✅ 续期成功', NO_BUTTON: '❌ 未找到按钮', FAIL: '❌ 续期失败', PENDING: '⏳ 未到续期时间' };
+  const ICON = { SUCCESS: '🟢', NO_BUTTON: '🟡', FAIL: '🔴', PENDING: '⏳' };
   const HIDE_DATE = new Set(['?', '-', '未读取到', '', null, undefined]);
   const lines = ['🎉 ACLClouds 续期通知', ''];
   for (const r of results) {
     lines.push(STATUS[r.status] || r.status);
     lines.push(`👤 账号: ${maskEmail()}`);
     lines.push(`🖥 服务器: ${r.id}`);
-    if (!HIDE_DATE.has(r.before)) lines.push(`📅 续期前到期：${r.before}`);
-    if (!HIDE_DATE.has(r.after)) lines.push(`📅 续期后到期：${r.after}`);
+    if (r.status !== 'PENDING' && !HIDE_DATE.has(r.before)) lines.push(`📅 续期前到期：${r.before}`);
+    if (r.status !== 'PENDING' && !HIDE_DATE.has(r.after)) lines.push(`📅 续期后到期：${r.after}`);
     // 内部 note（如 can_renew=false(…)/expires_at 已更新）不再展示；仅失败时保留简短原因
     if ((r.status === 'FAIL' || r.status === 'NO_BUTTON') && r.note) lines.push(`📝 ${String(r.note).slice(0, 120)}`);
     lines.push('');
