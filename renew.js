@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const net = require('net');
 const { chromium } = require('playwright');
 
 const env = (k, d = '') => (process.env[k] === undefined ? d : String(process.env[k])).trim() || d;
@@ -24,8 +25,6 @@ const CFG = {
   email: env('ACL_EMAIL'),
   password: env('ACL_PASSWORD'),
   cookieValue: env('COOKIE_VALUE'),
-  ghToken: env('GH_TOKEN'),
-  repo: env('GITHUB_REPOSITORY'),
   tgToken: env('TG_BOT_TOKEN'),
   tgChatId: env('TG_CHAT_ID'),
   // 代理地址：显式 PROXY_URL 优先，否则取 sing-box 脚本写入的 IS_PROXY/PROXY_SERVER
@@ -33,7 +32,7 @@ const CFG = {
   headless: bool('HEADLESS', true),
   dryRun: bool('DRY_RUN', false),
   timezone: env('TIMEZONE', 'Asia/Shanghai'),
-  locale: env('LOCALE', 'en-US'),
+  locale: env('LOCALE', 'fr-FR'),
   channel: env('BROWSER_CHANNEL'),
   navTimeout: num('NAV_TIMEOUT', 90000),
   shotDir: env('SHOT_DIR', 'screenshots'),
@@ -43,12 +42,10 @@ const CFG = {
 
 /* ============================== 小工具 ============================== */
 
-const nowStr = () => new Date().toLocaleString('zh-CN', { hour12: false });
-const log = (...a) => console.log(`[${nowStr()}]`, ...a);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** 北京时间（佬王同款：UTC+8，YYYY-MM-DD HH:mm:ss，不依赖 runner 时区） */
+/** 北京时间（UTC+8，YYYY-MM-DD HH:mm:ss，不依赖 runner 时区；日志与 TG 统一使用） */
 const bjTime = () => new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+const log = (...a) => console.log(`[${bjTime()}]`, ...a);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 当前出口 IP（直连裸请求；失败返回'获取失败'，不阻塞主流程） */
 function getCurrentIp(ms = 15000) {
@@ -84,7 +81,6 @@ function serverIdOf(url) {
 /** TCP 探测 host:port 是否可连（sing-box 存活校验），不通自动直连 */
 function tcpProbe(host, port, ms = 5000) {
   return new Promise((resolve) => {
-    const net = require('net');
     const s = new net.Socket();
     let done = false;
     const fin = (ok) => { if (!done) { done = true; s.destroy(); resolve(ok); } };
@@ -192,14 +188,77 @@ function buildAuthState() {
   };
 }
 
+/* ============================== API 预检 ============================== */
+
+const REMEMBER_COOKIE = 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d';
+
+/** 原生 https GET JSON（只带 remember_web，session 认证；不开浏览器） */
+function httpsGetJson(pathname, ms = 20000) {
+  return new Promise((resolve) => {
+    const headers = {
+      'User-Agent': CFG.ua,
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'fr-FR,fr;q=0.9',
+      'X-Requested-With': 'XMLHttpRequest',
+    };
+    headers.Cookie = `${REMEMBER_COOKIE}=${CFG.cookieValue}`;
+    const req = https.request({ hostname: 'aclclouds.com', path: pathname, method: 'GET', headers, timeout: ms }, (r) => {
+      let buf = '';
+      r.on('data', (c) => (buf += c));
+      r.on('end', () => {
+        if (r.statusCode !== 200) return resolve({ ok: false, reason: `HTTP ${r.statusCode}` });
+        try { resolve({ ok: true, json: JSON.parse(buf) }); }
+        catch { resolve({ ok: false, reason: 'JSON 解析失败' }); }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, reason: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, reason: 'timeout' }); });
+    req.end();
+  });
+}
+
+/**
+ * 预检是否进入续期窗口：GET /api/client/hosting/apps/<id>
+ * 返回 renews_at（到期）+ plan.renew_window_days（窗口天数，如 2）。
+ * 剩余时间 <= 窗口天数 视为可续；预检失败则返回 ok:false，由调用方降级走浏览器。
+ */
+async function apiRenewProbe(id) {
+  if (!CFG.cookieValue) return { ok: false, reason: '无 COOKIE_VALUE' };
+  const r = await httpsGetJson(`/api/client/hosting/apps/${encodeURIComponent(id)}`);
+  if (!r.ok) return r;
+  const a = (r.json && (r.json.attributes || (r.json.data && r.json.data.attributes))) || r.json || {};
+  const renewsAt = a.renews_at || a.expires_at || '';
+  const plan = a.plan || {};
+  const winDays = Number(plan.renew_window_days);
+  const windowMs = (Number.isFinite(winDays) && winDays > 0 ? winDays : 2) * 86400e3;
+  const t = Date.parse(renewsAt);
+  if (!renewsAt || !Number.isFinite(t)) return { ok: false, reason: '无 renews_at' };
+  if (a.suspended === true) return { ok: true, due: false, expiresAt: renewsAt, reason: '已暂停' };
+  return { ok: true, due: t - Date.now() <= windowMs, expiresAt: renewsAt };
+}
+
 /* ============================== 浏览器续期 ============================== */
 
 /** 是否已登录：页面出现服务器关键文案 */
 async function isLoggedIn(page) {
   try {
     const txt = await page.evaluate(() => (document.body.innerText || '').slice(0, 2000)).catch(() => '');
-    return /Time remaining|Free plan|Console|Dashboard/i.test(txt);
+    return /Time remaining|Temps restant|Free plan|Offre gratuite|Console|Dashboard|Mon bot/i.test(txt);
   } catch { return false; }
+}
+
+/** 读页面到期信息：优先已知 class，兜底按多语言文案抓正文（en：Time remaining / fr：Temps restant） */
+async function readExpiry(page) {
+  const txt = await page.evaluate(() => {
+    for (const s of ['.srv-expiry-text', '.srv-expiry', '[class*="expiry"]', '[class*="expiration"]']) {
+      const el = document.querySelector(s);
+      if (el && el.innerText && el.innerText.trim()) return el.innerText.trim().split('\n')[0].slice(0, 80);
+    }
+    const body = document.body.innerText || '';
+    const m = body.match(/(?:Time remaining|Temps restant)[^\n]{0,40}/i);
+    return m ? m[0].trim() : '';
+  }).catch(() => '');
+  return txt || '?';
 }
 
 /** 文本候选点击 */
@@ -248,31 +307,26 @@ async function renewOneServer(context, url, idx, total) {
       return result;
     }
 
-    // 从页面读到期时间（div.srv-expiry 内文案，如 "Temps restant : 3j 19h"）
-    const beforeTxt = await page.evaluate(() => {
-      const el = document.querySelector('.srv-expiry-text, .srv-expiry');
-      return el ? (el.innerText || '').trim().slice(0, 100) : '';
-    }).catch(() => '');
-    result.before = beforeTxt || '?';
+    // 从页面读到期时间（多语言：en "Time remaining" / fr "Temps restant"）
+    result.before = await readExpiry(page);
     log(`⏱️ 页面到期信息: ${result.before}`);
 
     if (CFG.dryRun) { result.status = 'PENDING'; result.note = 'DRY_RUN 演练，未点击'; return result; }
     // 找续期按钮（泛匹配；录制时 can_renew=false 故无精确选择器）
     const btn = page.locator('button, a, [role="button"]')
-      .filter({ hasText: /^.*renew.*$/i }).first();
+      .filter({ hasText: /renew|renouvel/i }).first();
     let hasBtn = false;
     try {
       await btn.waitFor({ state: 'visible', timeout: 8000 });
-      hasBtn = true;
       const label = (await btn.innerText().catch(() => 'Renew')).replace(/\s+/g, ' ').trim().slice(0, 60);
       log(`🔘 续期按钮: [${label}]`);
       await btn.click({ timeout: 8000 });
     } catch {
-      hasBtn = await clickByText(page, ['Renew', 'Renew Server', 'Renew now'], { timeout: 1500 });
+      hasBtn = await clickByText(page, ['Renew', 'Renew Server', 'Renew now', 'Renouveler', 'Renouveler le serveur'], { timeout: 1500 });
       if (!hasBtn) {
         // 页面明示到期前2天才可续 → 未到续期窗口，属正常状态
         const bodyTxt = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
-        if (/renewal[^.\n]{0,40}available/i.test(bodyTxt)) {
+        if (/renewal[^.\n]{0,40}available|renouvellement[^.\n]{0,60}disponible/i.test(bodyTxt)) {
           result.status = 'PENDING';
           result.note = '未到续期时间';
           return result;
@@ -329,8 +383,8 @@ async function renewOneServer(context, url, idx, total) {
           log('✅ Cap 已解算 (You\'re human)');
         } catch { log('ℹ️ 未探测到 Solved 文案，继续'); }
       } else {
-        const ok = await clickByText(modal, ['Renew', 'Confirm', 'Yes', 'Continue', 'Submit', 'OK'], { timeout: 1200 });
-        if (!ok) await clickByText(page.locator('body'), ['Confirm', 'Yes', 'OK'], { timeout: 1000 }).catch(() => false);
+        const ok = await clickByText(modal, ['Renew', 'Confirm', 'Yes', 'Continue', 'Submit', 'OK', 'Renouveler', 'Confirmer'], { timeout: 1200 });
+        if (!ok) await clickByText(page.locator('body'), ['Confirm', 'Yes', 'OK', 'Confirmer'], { timeout: 1000 }).catch(() => false);
       }
     } catch { log('ℹ️ 无独立确认弹窗，继续'); }
 
@@ -349,25 +403,27 @@ async function renewOneServer(context, url, idx, total) {
       await page.reload({ waitUntil: 'domcontentloaded', timeout: CFG.navTimeout });
       await sleep(2500);
     } catch { /* ignore */ }
-    const afterTxt = await page.evaluate(() => {
-      const el = document.querySelector('.srv-expiry-text, .srv-expiry');
-      return el ? (el.innerText || '').trim().slice(0, 100) : '';
-    }).catch(() => '');
-    result.after = afterTxt || '?';
+    result.after = await readExpiry(page);
     log(`🔍 复核: ${result.before} ➔ ${result.after}`);
     await safeShot(page, `server-${idx}-verify.png`);
 
-    if (/renewed|success|extended/i.test(low) || (result.before !== result.after)) {
+    const readOk = result.before !== '?' || result.after !== '?';
+    if (/renewed|success|extended|renouvel|prolong/i.test(low) || (readOk && result.before !== result.after)) {
       result.status = 'SUCCESS';
       result.note = alert || '页面到期信息已更新';
       log('🎉 续期成功');
-    } else if (/can't renew|unable|not yet|cooldown|too early/i.test(low)) {
+    } else if (/can't renew|unable|not yet|cooldown|too early|pas encore|impossible/i.test(low)) {
       result.status = 'PENDING';
       result.note = alert || '未到续期窗口';
       log(`⏳ ${result.note}`);
+    } else if (!readOk) {
+      // 到期信息完全读不到（DOM 或语言不匹配）→ 无法复核，不误报失败
+      result.status = 'UNKNOWN';
+      result.note = '已点击续期，但页面未读到到期信息，请人工确认';
+      log('❓ 已点击续期，未能确认（到期信息读取失败）');
     } else {
       result.status = 'FAIL';
-      result.note = alert ? `点击完成但未确认: ${alert}` : '点击完成但页面到期信息未变化（cap-widget 可能未解算成功）';
+      result.note = alert ? `点击完成但未确认: ${alert}` : '点击完成但页面到期信息未变化';
       await safeShot(page, `server-${idx}-fail.png`);
       log('❌ 未能确认续期成功');
     }
@@ -501,10 +557,10 @@ async function doLogin(page) {
 /* ============================== 汇报 ============================== */
 
 /** TG 报告（佬王同款 eooce 风：标题 + 状态 + 脱敏账号 + 前后到期 + IP + 北京时间） */
-async function reportResults(results, currentIp = '未知') {
+async function reportResults(results, currentIp = '未知', skippedCount = 0) {
   results.sort((a, b) => a.idx - b.idx);
-  const STATUS = { SUCCESS: '✅ 续期成功', NO_BUTTON: '❌ 未找到按钮', FAIL: '❌ 续期失败', PENDING: '⏳ 未到续期时间' };
-  const ICON = { SUCCESS: '🟢', NO_BUTTON: '🟡', FAIL: '🔴', PENDING: '⏳' };
+  const STATUS = { SUCCESS: '✅ 续期成功', NO_BUTTON: '❌ 未找到按钮', FAIL: '❌ 续期失败', PENDING: '⏳ 未到续期时间', UNKNOWN: '❓ 已点击待确认' };
+  const ICON = { SUCCESS: '🟢', NO_BUTTON: '🟡', FAIL: '🔴', PENDING: '⏳', UNKNOWN: '❓' };
   const HIDE_DATE = new Set(['?', '-', '未读取到', '', null, undefined]);
   const lines = ['🎉 ACLClouds 续期通知', ''];
   for (const r of results) {
@@ -513,15 +569,16 @@ async function reportResults(results, currentIp = '未知') {
     lines.push(`🖥 服务器: ${r.id}`);
     if (r.status !== 'PENDING' && !HIDE_DATE.has(r.before)) lines.push(`📅 续期前到期：${r.before}`);
     if (r.status !== 'PENDING' && !HIDE_DATE.has(r.after)) lines.push(`📅 续期后到期：${r.after}`);
-    // 内部 note（如 can_renew=false(…)/expires_at 已更新）不再展示；仅失败时保留简短原因
-    if ((r.status === 'FAIL' || r.status === 'NO_BUTTON') && r.note) lines.push(`📝 ${String(r.note).slice(0, 120)}`);
+    // 成功/未到窗口不展示内部 note；失败与待确认时保留简短原因
+    if ((r.status === 'FAIL' || r.status === 'NO_BUTTON' || r.status === 'UNKNOWN') && r.note) lines.push(`📝 ${String(r.note).slice(0, 120)}`);
     lines.push('');
   }
+  if (skippedCount > 0) lines.push(`⏭️ 未到续期窗口跳过：${skippedCount} 个`);
   lines.push(`🌐 续期使用IP: ${currentIp}`);
   lines.push(`🕒 续期时间：${bjTime()}`);
   await sendTelegram(lines.join('\n'));
   console.log('\n================ 汇总 ================');
-  results.forEach((r) => console.log(`${ICON[r.status]} [${r.idx}/${r.total}] ${r.id} ${r.before}${r.after ? ' ➔ ' + r.after : ''} ${r.note}`));
+  results.forEach((r) => console.log(`${ICON[r.status] || '•'} [${r.idx}/${r.total}] ${r.id} ${r.before}${r.after ? ' ➔ ' + r.after : ''} ${r.note}`));
   // 失败只走 TG 通知感知，工作流一律绿色（exit 0），避免红灯打扰
   process.exitCode = 0;
 }
@@ -552,7 +609,7 @@ async function reportResults(results, currentIp = '未知') {
     headless: CFG.headless,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled',
-      '--disable-dev-shm-usage', '--window-size=1920,1080', '--lang=en-US', '--no-first-run',
+      '--disable-dev-shm-usage', '--window-size=1920,1080', `--lang=${CFG.locale}`, '--no-first-run',
     ],
   };
   if (CFG.proxyUrl) {
@@ -568,12 +625,31 @@ async function reportResults(results, currentIp = '未知') {
   } else { log('🍭 直连模式（未配置 NODE_LINK 则 workflow 不起 sing-box）'); }
   if (CFG.channel) launchOpts.channel = CFG.channel;
 
+  // API 预检：未到续期窗口的直接跳过（不开浏览器、不发通知）
+  const browserTargets = targets.map((url, i) => ({ url, idx: i + 1 }));
+  const toRenew = [];
+  const skipped = [];
+  for (const t of browserTargets) {
+    const id = serverIdOf(t.url);
+    const probe = await apiRenewProbe(id);
+    if (probe.ok && !probe.due) {
+      skipped.push({ ...t, id, expiresAt: probe.expiresAt });
+      log(`⏭️ [${t.idx}] ${id} 未到续期窗口（到期 ${probe.expiresAt}），跳过`);
+    } else {
+      if (!probe.ok) log(`ℹ️ [${t.idx}] ${id} 预检不可用（${probe.reason}），走浏览器`);
+      toRenew.push(t);
+    }
+  }
+  if (!toRenew.length) {
+    log(`✅ 全部 ${skipped.length} 个服务器均未到续期窗口，本次不启动浏览器、不发送通知`);
+    return;
+  }
+
   const currentIp = await getCurrentIp();
   log(`🎯 当前出口IP: ${currentIp}`);
 
   // 启动浏览器
   const results = [];
-  const browserTargets = targets.map((url, i) => ({ url, idx: i + 1 }));
   const browser = await chromium.launch(launchOpts);
   const ctxOpts = { viewport: { width: 1920, height: 1080 }, userAgent: CFG.ua, locale: CFG.locale, timezoneId: CFG.timezone };
   if (state) ctxOpts.storageState = state;
@@ -599,16 +675,16 @@ async function reportResults(results, currentIp = '未知') {
     await dumpState(context);
   } finally { await first.close().catch(() => {}); }
 
-  for (const t of browserTargets) {
-    try { results.push(await renewOneServer(context, t.url, t.idx, targets.length)); }
-    catch (e) { log(`❌ 服务器 ${t.idx} 未捕获异常: ${e.message}`); results.push({ idx: t.idx, total: targets.length, url: t.url, id: serverIdOf(t.url), status: 'FAIL', before: '-', after: '-', note: e.message.slice(0, 100) }); }
+  for (const t of toRenew) {
+    try { results.push(await renewOneServer(context, t.url, t.idx, toRenew.length)); }
+    catch (e) { log(`❌ 服务器 ${t.idx} 未捕获异常: ${e.message}`); results.push({ idx: t.idx, total: toRenew.length, url: t.url, id: serverIdOf(t.url), status: 'FAIL', before: '-', after: '-', note: e.message.slice(0, 100) }); }
     await sleep(1500);
   }
   await context.storageState({ path: path.join(CFG.shotDir, 'storage-state-final.json') }).catch(() => {});
   await browser.close();
   log('🏁 浏览器已关闭');
 
-  await reportResults(results, currentIp);
+  await reportResults(results, currentIp, skipped.length);
 })().catch(async (e) => {
   console.error('❌ 全局致命错误:', e.message);
   const ip = await getCurrentIp();

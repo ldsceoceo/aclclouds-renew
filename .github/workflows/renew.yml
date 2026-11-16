@@ -4,8 +4,10 @@ on:
   workflow_dispatch:
   schedule:
     # Free 档每 4 天续订一次，续期窗口 = 到期前 2 天开放（连续 2 天）。
-    # 每 3 天跑一次（1,4,7,...），任意连续 2 天窗口必被覆盖（3 天间隔最大跨 3 个日历日，覆盖 2 天窗口无死角）。
-    - cron: '10 10 1,4,7,10,13,16,19,22,25,28,31 * *'
+    # 每 2 天跑一次（UTC 0:00 = 北京 8:00；day-of-month 步进 = 1/3/5/…/31），
+    # 任意连续 2 天必含一个奇数日，窗口必命中；月末 31→次月 1 只隔 1 天，多跑不漏。
+    # 未到窗口由 API 预检直接跳过（不开浏览器、不发通知），多跑成本极低。
+    - cron: '0 0 */2 * *'
 
 permissions:
   actions: write
@@ -59,7 +61,7 @@ jobs:
           DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
           HEADLESS: true
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Shanghai' }}
-          LOCALE: en-US
+          LOCALE: fr-FR
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: npm start
@@ -84,7 +86,9 @@ jobs:
             echo "No need to commit"
           else
             git commit -m "⏱️ Auto Update $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
-            git push origin HEAD
+            # 远端可能有网页端/其他流水线的提交，先 rebase 再推，避免非快进被拒
+            git pull --rebase --autostash origin main || true
+            git push origin HEAD || { git pull --rebase --autostash origin main; git push origin HEAD; }
           fi
 
       - name: 🧹 清理旧工作流记录

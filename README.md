@@ -4,9 +4,10 @@
 
 ## 原理
 
-1. 登录：注入 `COOKIE_VALUE`（remember_web cookie 值），或账密登录 `ACL_EMAIL` + `ACL_PASSWORD`。
-2. 续期：进服务器页，点 Renew（含确认弹窗 cap-widget），刷新页面读 `.srv-expiry` 文案验真。
-3. 通知：Telegram 推送成功 / 失败。
+1. 预检：`GET /api/client/hosting/apps/<id>`（只带 `COOKIE_VALUE`）读 `renews_at` + `plan.renew_window_days`；未进入续期窗口（到期前 2 天）直接跳过，不开浏览器、不发通知。
+2. 登录：注入 `COOKIE_VALUE`（remember_web cookie 值），或账密登录 `ACL_EMAIL` + `ACL_PASSWORD`。
+3. 续期：进服务器页，点 Renew（含确认弹窗 cap-widget），刷新页面读 `.srv-expiry` 文案验真。
+4. 通知：仅在浏览器实际启动续期后推送 Telegram（成功 / 失败 / 待确认）。
 
 ## Secrets
 
@@ -22,6 +23,8 @@
 | `NODE_LINK` | ❌ | 代理节点（vless/hy2/vmess/trojan/tuic/anytls/socks5），配了则 workflow 起 sing-box，不通自动直连 | `vless://...` |
 
 > *1：`COOKIE_VALUE` 与 `ACL_EMAIL+ACL_PASSWORD` 二选一，优先 `COOKIE_VALUE`。
+>
+> 站点页面为法语，脚本按法语/英语双语文案匹配；`LOCALE` 默认 `fr-FR`（可用环境变量覆盖）。
 
 ### 如何取 COOKIE_VALUE
 
@@ -35,7 +38,7 @@ COOKIE_VALUE 失效信号：日志出现 `COOKIE_VALUE 已失效，降级为账�
 
  1. 新建 GitHub 仓库，把本目录文件推上去。
  2. Settings → Secrets and variables → Actions 配好上表 Secrets。
- 3. Actions 启用工作流，手动跑一次看日志。定时为每 3 天巡检一次（`renew.yml` cron `10 10 1,4,7,...,31 * *`）：Free 档 4 天一续、到期前 2 天开放续期，3 天间隔必覆盖 2 天窗口。每次运行自动更新 `time.txt`，防止 6 个月无活动导致 GitHub 暂停 Actions。
+ 3. Actions 启用工作流，手动跑一次看日志。定时为每 2 天巡检一次（`renew.yml` cron `0 0 */2 * *`，UTC 0:00 = 北京 8:00）：未到续期窗口由 API 预检直接跳过（不开浏览器、不发通知）；任意连续 2 天必含一个奇数日，2 天窗口必命中。每次运行自动更新 `time.txt`，防止 6 个月无活动导致 GitHub 暂停 Actions。
 
 ## 本地调试
 
