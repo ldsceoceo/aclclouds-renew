@@ -562,6 +562,13 @@ async function reportResults(results, currentIp = '未知', skippedCount = 0) {
   const STATUS = { SUCCESS: '✅ 续期成功', NO_BUTTON: '❌ 未找到按钮', FAIL: '❌ 续期失败', PENDING: '⏳ 未到续期时间', UNKNOWN: '❓ 已点击待确认' };
   const ICON = { SUCCESS: '🟢', NO_BUTTON: '🟡', FAIL: '🔴', PENDING: '⏳', UNKNOWN: '❓' };
   const HIDE_DATE = new Set(['?', '-', '未读取到', '', null, undefined]);
+  if (!results.some((r) => r.status !== 'PENDING')) {
+    console.log('\n================ 汇总 ================');
+    results.forEach((r) => console.log(`${ICON[r.status] || '•'} [${r.idx}/${r.total}] ${r.id} ${r.before}${r.after ? ' ➔ ' + r.after : ''} ${r.note}`));
+    log(`⏳ 全部 ${results.length} 个服务器均未到续期时间，不发送 TG 通知`);
+    process.exitCode = 0;
+    return;
+  }
   const lines = ['🎉 ACLClouds 续期通知', ''];
   for (const r of results) {
     lines.push(STATUS[r.status] || r.status);
