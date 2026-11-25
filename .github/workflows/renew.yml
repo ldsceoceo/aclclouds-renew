@@ -58,6 +58,7 @@ jobs:
           SERVER_PAGE_URL: ${{ secrets.SERVER_PAGE_URL }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          AUTO_UPDATE_STATE: ${{ vars.AUTO_UPDATE_STATE || 'true' }}
           DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
           HEADLESS: true
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Shanghai' }}

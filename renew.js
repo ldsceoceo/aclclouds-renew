@@ -25,6 +25,9 @@ const CFG = {
   email: env('ACL_EMAIL'),
   password: env('ACL_PASSWORD'),
   cookieValue: env('COOKIE_VALUE'),
+  ghToken: env('GH_TOKEN'),
+  autoUpdateState: bool('AUTO_UPDATE_STATE', false),
+  repo: env('GITHUB_REPOSITORY'),
   tgToken: env('TG_BOT_TOKEN'),
   tgChatId: env('TG_CHAT_ID'),
   // 代理地址：显式 PROXY_URL 优先，否则取 sing-box 脚本写入的 IS_PROXY/PROXY_SERVER
@@ -287,6 +290,34 @@ async function dumpState(context) {
   } catch (e) {
     log(`⚠️ 导出登录态失败: ${e.message}`);
     return null;
+  }
+}
+
+/** 从 storageState JSON 中提取 remember_web 的当前值 */
+function rememberWebFromState(stateStr) {
+  try {
+    const st = typeof stateStr === 'string' ? JSON.parse(stateStr) : stateStr;
+    const c = (st.cookies || []).find((x) => x && x.name === REMEMBER_COOKIE && x.value);
+    return c ? c.value : null;
+  } catch { return null; }
+}
+
+/** 用 gh CLI 把最新 remember_web 回写到 Secret COOKIE_VALUE（gh 自带 sealed-box 加密） */
+async function updateGithubSecret(name, value) {
+  if (!CFG.ghToken || !CFG.repo) { log('ℹ️ 未提供 GH_TOKEN/GITHUB_REPOSITORY，跳过回写 Secret'); return false; }
+  const [owner, repo] = CFG.repo.split('/');
+  try {
+    const { execFile } = require('child_process');
+    await new Promise((resolve, reject) => {
+      execFile('gh', ['secret', 'set', name, '--body', value, '--repo', `${owner}/${repo}`],
+        { env: { ...process.env, GH_TOKEN: CFG.ghToken }, timeout: 60000 },
+        (err, so, se) => (err ? reject(new Error(se || err.message)) : resolve(so)));
+    });
+    log(`✅ 已回写 Secret: ${name}`);
+    return true;
+  } catch (e) {
+    log(`⚠️ gh CLI 回写失败: ${String(e.message).slice(0, 200)}`);
+    return false;
   }
 }
 
@@ -678,7 +709,7 @@ async function reportResults(results, currentIp = '未知', skippedCount = 0) {
       await dumpState(context);
       throw new Error('登录失败（COOKIE_VALUE 和账密均不可用）');
     }
-    // 导出登录态供本地调试（不自动回写 Secret，COOKIE_VALUE 需手动更新）
+    // 导出登录态供本地调试
     await dumpState(context);
   } finally { await first.close().catch(() => {}); }
 
@@ -687,9 +718,21 @@ async function reportResults(results, currentIp = '未知', skippedCount = 0) {
     catch (e) { log(`❌ 服务器 ${t.idx} 未捕获异常: ${e.message}`); results.push({ idx: t.idx, total: toRenew.length, url: t.url, id: serverIdOf(t.url), status: 'FAIL', before: '-', after: '-', note: e.message.slice(0, 100) }); }
     await sleep(1500);
   }
-  await context.storageState({ path: path.join(CFG.shotDir, 'storage-state-final.json') }).catch(() => {});
+  const finalState = await context.storageState({ path: path.join(CFG.shotDir, 'storage-state-final.json') }).catch(() => null);
   await browser.close();
   log('🏁 浏览器已关闭');
+
+  if (CFG.autoUpdateState && CFG.ghToken) {
+    const rw = rememberWebFromState(finalState);
+    if (rw && rw !== CFG.cookieValue) {
+      log(`🔄 remember_web 已轮换，准备回写 Secret COOKIE_VALUE`);
+      await updateGithubSecret('COOKIE_VALUE', rw);
+    } else if (!rw) {
+      log('⚠️ 最终登录态未找到 remember_web，跳过回写');
+    } else {
+      log('ℹ️ remember_web 未变化，无需回写');
+    }
+  }
 
   await reportResults(results, currentIp, skipped.length);
 })().catch(async (e) => {
